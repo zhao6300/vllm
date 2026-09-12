@@ -57,7 +57,6 @@ def _write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
 
 
-<<<<<<< HEAD
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-specific test")
 @pytest.mark.parametrize(
     ("is_mm_prefix_lm", "is_multimodal_model", "expected"),
