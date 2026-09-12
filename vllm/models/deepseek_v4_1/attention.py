@@ -43,6 +43,7 @@ from vllm.config import (
     get_current_vllm_config,
 )
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.platforms import current_platform
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -468,6 +469,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self._uses_fp8_ds_mla_layout(), cache_config.cache_dtype, cache_config
         )
 
+        # Determine block_size based on GPU architecture for SM120/121 support.
+        # Defaults to 32 if platform info is unavailable (e.g., non-GPU CI).
+        try:
+            is_sm120_or_sm121 = (
+                current_platform.is_device_capability_family(120)
+                or current_platform.is_device_capability_family(121)
+            )
+            swa_block_size = 64 if is_sm120_or_sm121 else 32
+        except (AttributeError, RuntimeError):
+            # Fallback for non-GPU environments or when platform is unavailable
+            swa_block_size = 32
+
         self.swa_cache_layer = DeepseekV4SWACache(
             head_dim=self.head_dim,
             window_size=self.window_size,
@@ -475,7 +488,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             prefix=f"{prefix}.swa_cache",
             cache_config=cache_config,
             backend_cls=self.swa_backend_cls,
-            block_size=32,
+            block_size=swa_block_size,
         )
 
         # The attention layer itself was already registered with the
