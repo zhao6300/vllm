@@ -88,9 +88,17 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
         if qa is not None:
             input_mxfp8, input_scale = qa.data, qa.scale
             out_dtype, input_shape = qa.orig_dtype, qa.orig_shape
+            if input_shape[0] == 0:
+                return torch.empty(
+                    (0, N), device=weight.device, dtype=out_dtype
+                )
         else:
             assert isinstance(x, torch.Tensor)
             out_dtype, input_shape = x.dtype, x.shape
+            if input_shape[0] == 0:
+                return torch.empty(
+                    (0, N), device=weight.device, dtype=out_dtype
+                )
             input_mxfp8, input_scale = mxfp8_e4m3_quantize(
                 x.view(-1, K), is_sf_swizzled_layout=True
             )
