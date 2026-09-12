@@ -80,6 +80,12 @@ class EngramConfig:
                 "Engram embedding_across_dp is not supported with elastic EP yet."
             )
 
+        if self.embedding_across_dp and parallel_config.use_sequence_parallel_moe:
+            raise NotImplementedError(
+                "Engram embedding_across_dp is not supported with sequence "
+                "parallel yet."
+            )
+
     def get_parallel_size(self, parallel_config: "ParallelConfig") -> int:
         """Derive the embedding group size from the parallel configuration."""
         size = parallel_config.tensor_parallel_size

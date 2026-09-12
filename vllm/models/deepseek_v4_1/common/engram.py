@@ -42,11 +42,13 @@ from torch import nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
+    get_dp_group,
+    get_etp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.utils import set_weight_attrs
@@ -621,11 +623,11 @@ def _engram_lookup_kernel(
 
 
 class ParallelEngramEmbedding(nn.Module):
-    """The n-gram hash table, sharded by complete hash heads over TP ranks.
+    """The n-gram hash table, sharded by complete hash heads over ETP ranks.
     Rows stay fp8 and are dequantized with ue8m0 per-32 scales on lookup.
 
     With `cpu_offload` the shard lives in pinned host memory and is read over
-    UVA instead of HBM; the TP sharding is unchanged either way.
+    UVA instead of HBM; the sharding group is unchanged either way.
     """
 
     def __init__(
@@ -637,8 +639,9 @@ class ParallelEngramEmbedding(nn.Module):
         cpu_offload: bool = False,
     ):
         super().__init__()
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
+        parallel_group = get_etp_group()
+        tp_size = parallel_group.world_size
+        tp_rank = parallel_group.rank_in_group
         assert head_sizes and all(size > 0 for size in head_sizes)
         assert sum(head_sizes) <= num_embeddings
         if cpu_offload and not is_uva_available():
@@ -654,6 +657,14 @@ class ParallelEngramEmbedding(nn.Module):
         self.vocab_end_idx = sum(head_sizes[:head_end])
         self.part_num_embeddings = self.vocab_end_idx - self.vocab_start_idx
         self.tp_size = tp_size
+        self.parallel_group = parallel_group
+        self.tp_world_size = get_tensor_model_parallel_world_size()
+        if tp_size % self.tp_world_size:
+            raise ValueError(
+                "Engram ETP size must be divisible by TP size, but got "
+                f"ETP={tp_size} and TP={self.tp_world_size}"
+            )
+        self.etp_data_parallel_size = tp_size // self.tp_world_size
         self.cpu_offload = cpu_offload
         self._views: tuple[torch.Tensor, torch.Tensor] | None = None
         self._view_src: tuple[int, int] | None = None
@@ -758,7 +769,7 @@ class ParallelEngramEmbedding(nn.Module):
         )
         self.lookup(indices, out)
         if self.tp_size > 1:
-            out = tensor_model_parallel_all_gather(out, dim=1)
+            out = self.parallel_group.all_gather(out, dim=1)
             out = out[:, : self.n_hash_cols]
         return out
 
@@ -903,6 +914,8 @@ class Engram(nn.Module):
         self.eps = config.rms_norm_eps
         self.clamp_value = 1e-6
         self.use_sequence_parallel = use_sequence_parallel
+        self._dp_group = get_dp_group()
+        self._dp_rank = self._dp_group.rank_in_group
 
         # Named ``embed_tokens`` so the checkpoint's ``engram.embed.weight``
         # survives the mapper's ``embed.weight`` -> ``embed_tokens.weight``
@@ -935,7 +948,7 @@ class Engram(nn.Module):
         max_tokens = get_current_vllm_config().scheduler_config.max_num_batched_tokens
         # Keep lookup results alive across breakable graph segments.
         self.staged_rows = torch.empty(
-            max_tokens,
+            max_tokens * max(1, self.embed_tokens.etp_data_parallel_size),
             self.embed_tokens.part_n_hash_cols,
             layout.head_dim,
             dtype=torch.bfloat16,
@@ -954,13 +967,75 @@ class Engram(nn.Module):
         rows = getattr(self, "_lookup_rows", None)
         return dbo_current_ubatch_id() if rows is not None and len(rows) > 1 else 0
 
+    def _get_dp_gather_slot(self, local_num_tokens: int) -> tuple[int, int]:
+        """Return the padded DP token-slot size and local-rank slot offset."""
+        etp_size = self.embed_tokens.etp_data_parallel_size
+        if etp_size == 1:
+            return local_num_tokens, 0
+        dp_metadata = get_forward_context().dp_metadata
+        if dp_metadata is None:
+            raise RuntimeError("ETP spanning DP requires DP token metadata")
+        data_parallel_rank = self._dp_group.rank_in_group
+        group_start = (data_parallel_rank // etp_size) * etp_size
+        group_end = group_start + etp_size
+        slot_size = max(
+            dp_metadata.num_tokens_across_dp_cpu[group_start:group_end].tolist()
+        )
+        slot_offset = (data_parallel_rank - group_start) * slot_size
+        return slot_size, slot_offset
+
+    def _padded_local_rows(
+        self,
+        rows: torch.Tensor,
+        local_num_tokens: int,
+        slot_offset: int,
+        slot_size: int,
+    ) -> torch.Tensor:
+        """Pad row shards so ETP ranks exchange identical tensor shapes."""
+        if self.embed_tokens.etp_data_parallel_size == 1:
+            return rows
+        rows = torch.cat(
+            (
+                rows,
+                torch.zeros(
+                    (slot_size - local_num_tokens,) + rows.shape[1:],
+                    dtype=rows.dtype,
+                    device=rows.device if local_num_tokens > 0 else "cpu",
+                ),
+            ),
+            dim=0,
+        ).to(device=rows.device)
+        gathered = self.embed_tokens.parallel_group.all_gather(rows, dim=1)
+        return gathered[slot_offset : slot_offset + local_num_tokens]
+
+    def _gather_dp_ids(
+        self, hash_ids: torch.Tensor, slot_size: int
+    ) -> torch.Tensor:
+        """Gather DP-local hash ids so every ETP rank sees the full tokenset."""
+        if self.embed_tokens.etp_data_parallel_size == 1:
+            return hash_ids
+        if hash_ids.shape[0] < slot_size:
+            hash_ids = torch.cat(
+                (
+                    hash_ids,
+                    hash_ids.new_full(
+                        (slot_size - hash_ids.shape[0], hash_ids.shape[1]),
+                        DEAD_ID,
+                    ),
+                ),
+                dim=0,
+            )
+        return self._dp_group.all_gather(hash_ids, dim=0)
+
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> torch.Tensor:
         """Stage lookup rows in the current microbatch's own buffer."""
         buffers = getattr(self, "_lookup_rows", None)
+        slot_size, _ = self._get_dp_gather_slot(hash_ids.shape[0])
+        prepared_ids = self._gather_dp_ids(hash_ids, slot_size)
         rows = (
             buffers[self._lookup_slot()] if buffers is not None else self.staged_rows
-        )[: hash_ids.shape[0]]
-        self.embed_tokens.lookup(hash_ids, rows)
+        )[: prepared_ids.shape[0]]
+        self.embed_tokens.lookup(prepared_ids, rows)
         return rows
 
     def embed(
@@ -974,13 +1049,24 @@ class Engram(nn.Module):
                 if buffers is not None
                 else self.staged_rows
             )
-        rows = prepared_rows[: hash_ids.shape[0]]
+        (
+            slot_size,
+            slot_offset,
+        ) = self._get_dp_gather_slot(hash_ids.shape[0])
+        rows = self._padded_local_rows(
+            prepared_rows[: hash_ids.shape[0]],
+            hash_ids.shape[0],
+            slot_offset,
+            slot_size,
+        )
+        if self.embed_tokens.etp_data_parallel_size > 1:
+            return rows
         if self.embed_tokens.tp_size == 1:
             return rows
         if self.use_sequence_parallel:
             tp_size = self.embed_tokens.tp_size
             num_tokens, local_heads, dim = rows.shape
-            gathered = tensor_model_parallel_all_gather(rows, dim=0)
+            gathered = self.embed_tokens.parallel_group.all_gather(rows, dim=0)
             chunk = (num_tokens + tp_size - 1) // tp_size
             rows = rows.new_empty((chunk, self.embed_tokens.n_hash_cols, dim))
             _engram_sp_rows_kernel[(triton.cdiv(rows.numel(), 1024),)](
@@ -994,8 +1080,11 @@ class Engram(nn.Module):
                 BLOCK_SIZE=1024,
             )
             return rows
-        rows = tensor_model_parallel_all_gather(rows, dim=1)
-        return rows[:, : self.embed_tokens.n_hash_cols]
+        gathered = self.embed_tokens.parallel_group.all_gather(rows, dim=1)
+        gathered = gathered[:, : self.embed_tokens.n_hash_cols]
+        if self.embed_tokens.etp_data_parallel_size > 1:
+            return gathered[slot_offset : slot_offset + hash_ids.shape[0]]
+        return gathered
 
     def forward(
         self,

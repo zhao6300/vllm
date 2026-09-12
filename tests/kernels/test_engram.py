@@ -117,6 +117,7 @@ def test_fused_engram_post_wkv_matches_reference(
     module.embed_tokens = torch.nn.Identity()
     # `forward` reads rows staged by `prepare_embeddings`, so inject kv there.
     module.embed_tokens.tp_size = 1
+    module.embed_tokens.etp_data_parallel_size = 1
     module.staged_rows = kv.unsqueeze(1)
     if use_sequence_parallel:
         padded = torch.nn.functional.pad(kv, (0, 0, 0, (-num_kv_tokens) % tp_size))
@@ -587,6 +588,14 @@ def test_engram_head_shards_reconstruct_checkpoint(cpu_offload, tp_size, monkeyp
         monkeypatch.setattr(
             engram_ops, "get_tensor_model_parallel_rank", lambda rank=rank: rank
         )
+        group = SimpleNamespace(
+            world_size=tp_size,
+            rank_in_group=rank,
+            all_gather=lambda tensor, dim, rank=rank: (
+                torch.cat(shards, dim=dim) if shards else tensor
+            ),
+        )
+        monkeypatch.setattr(engram_ops, "get_etp_group", lambda: group)
         with torch.device("cuda"):
             layer = ParallelEngramEmbedding(
                 num_rows + 7, dim, head_sizes, cpu_offload=cpu_offload
@@ -614,7 +623,8 @@ def test_engram_head_shards_reconstruct_checkpoint(cpu_offload, tp_size, monkeyp
         torch.testing.assert_close(local, shards[0], rtol=0, atol=0)
         return torch.cat(shards, dim=dim)
 
-    monkeypatch.setattr(engram_ops, "tensor_model_parallel_all_gather", gather)
+    for layer in layers:
+        layer.parallel_group.all_gather = lambda local, dim=-1: gather(local, dim)
     torch.testing.assert_close(layers[0](ids), expected, rtol=0, atol=0)
     module = Engram.__new__(Engram)
     torch.nn.Module.__init__(module)
@@ -659,6 +669,81 @@ def test_engram_lookup_matches_torch(cpu_offload, background, num_tokens):
     assert torch.equal(out, expected)
 
 
+@pytest.mark.parametrize("rank", [0, 1, 2, 3])
+def test_engram_etp_gathers_complete_head_shards(rank):
+    """ETP concat is by hash columns, not by the local rank's token rows."""
+    tokens, heads, dim = 7, 8, 16
+    parts = (1, 3, 3, 1)
+    expected = (
+        torch.arange(tokens * heads * dim, dtype=torch.float32)
+        .reshape(tokens, heads, dim)
+        .to(torch.bfloat16)
+    )
+    local_rows = expected[:, sum(parts[:rank]) : sum(parts[:rank]) + parts[rank]]
+    engram = Engram.__new__(Engram)
+    torch.nn.Module.__init__(engram)
+    engram.use_sequence_parallel = False
+    engram.embed_tokens = SimpleNamespace(
+        tp_size=4,
+        n_hash_cols=heads,
+        etp_data_parallel_size=1,
+        parallel_group=SimpleNamespace(
+            rank_in_group=rank,
+            all_gather=lambda rows, dim=-1: torch.cat(
+                [
+                    expected[:, 0:1],
+                    expected[:, 1:4],
+                    expected[:, 4:7],
+                    expected[:, 7:8],
+                ],
+                dim=dim,
+            ),
+        ),
+    )
+    engram.staged_rows = local_rows
+    engram._lookup_rows = None
+    assert torch.equal(engram.embed(torch.empty(tokens, heads, dtype=torch.int32)), expected)
+
+
+def test_engram_etp_gathers_slots_with_rank_compare(monkeypatch):
+    """Ensure all rank token counts are padded to the global max and aligned."""
+    token_counts = torch.tensor([9, 6, 12, 5])
+    local_num_tokens = 6
+    slot_size = 12
+    other_ids = torch.full((slot_size * (4 - 1), 4), -1, dtype=torch.int32)
+    dp_group = SimpleNamespace(
+        rank_in_group=1,
+        all_gather=lambda tensor, dim: torch.cat((tensor, other_ids), dim=dim),
+    )
+    etp_group = SimpleNamespace(
+        all_gather=lambda tensor, dim: torch.cat((tensor, other_ids), dim=dim),
+    )
+    module = Engram.__new__(Engram)
+    torch.nn.Module.__init__(module)
+    module.embed_tokens = SimpleNamespace(
+        etp_data_parallel_size=4,
+        n_hash_cols=4,
+        tp_size=4,
+        parallel_group=etp_group,
+    )
+    module._dp_group = dp_group
+    module._lookup_rows = None
+    module.use_sequence_parallel = False
+    module.staged_rows = torch.empty(0)
+    monkeypatch.setattr(
+        engram_ops, "get_forward_context",
+        lambda: SimpleNamespace(
+            dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=token_counts)
+        ),
+    )
+    assert module._get_dp_gather_slot(
+        local_num_tokens
+    ) == (slot_size, slot_size)
+    ids = torch.arange(local_num_tokens * 4).reshape(local_num_tokens, 4)
+    gathered_ids = module._gather_dp_ids(ids, slot_size)
+    assert gathered_ids.shape == (slot_size * 4, 4)
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
 @pytest.mark.parametrize("cpu_offload", [False, True])
 @pytest.mark.parametrize("capture", ["eager", "full", "breakable"])
@@ -676,6 +761,7 @@ def _run_engram_prepared_rows(
     cols, num_tokens = (23, 65) if use_sequence_parallel else (24, 64)
     layer.n_hash_cols = cols
     layer.tp_size = tp_size
+    layer.etp_data_parallel_size = 1
     layer.part_n_hash_cols = (cols + tp_size - 1) // tp_size
     layer.head_start = rank * layer.part_n_hash_cols
     engram = Engram.__new__(Engram)
