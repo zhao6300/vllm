@@ -109,10 +109,6 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
     ]
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [128]
-
-    @staticmethod
     def get_name() -> str:
         return "FLASHINFER_MLA_SPARSE_DSV41"
 
