@@ -455,6 +455,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # [1] doubles as post-GEMM event1. Reuse is safe: GEMM fully joins
         # before post-GEMM starts.
         self.ln_events = [torch.cuda.Event() for _ in range(4)]
+        self._multi_streams_warmed = False
 
         assert cache_config is not None, "DeepseekV4 attention requires cache_config"
         # ---- Attention / KV-cache setup ----
@@ -791,19 +792,50 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         torch.Tensor | None,
         torch.Tensor | None,
     ]:
-        aux_streams = self.aux_stream_list
-        if aux_streams is not None:
-            aux_streams = aux_streams[:2]
-
         # fused_wqa_wkv (heaviest) on default; the two lighter input GEMMs on
         # aux streams 0/1 when their owning module exists. ln_events[0] is the
         # fan-out start event; ln_events[1..2] are per-aux done events. The
         # v4.1 indexer derives K from the kv-source compressor's latent, so
         # unlike v4.0 there is no indexer K GEMM over hidden_states here.
+        default_fn, aux_fns = self._projection_fns(hidden_states)
+
+        qr_kv, (kv_score, indexer_weights) = execute_in_parallel(
+            default_fn,
+            aux_fns,
+            self.ln_events[0],
+            self.ln_events[1:3],
+            self.aux_stream_list[:2],
+            enable=hidden_states.shape[0]
+            <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
+            allow_capture=self._multi_streams_warmed,
+        )
+
+        return qr_kv, kv_score, indexer_weights
+
+    def warmup_multi_stream_cudagraph(self, hidden_states: torch.Tensor) -> None:
+        if (
+            self._multi_streams_warmed
+            or self.aux_stream_list is None
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return
+
+        default_fn, aux_fns = self._projection_fns(hidden_states)
+        for index, fn in enumerate(aux_fns):
+            if fn is None:
+                continue
+            with torch.cuda.stream(self.aux_stream_list[index]):
+                fn()
+        default_fn()
+        torch.cuda.synchronize()
+        self._multi_streams_warmed = True
+
+    def _projection_fns(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[Callable[[], torch.Tensor], list[Callable[[], Any] | None]]:
         aux_fns: list[Callable[[], Any] | None] = [None, None]
 
         if self.compressor is not None:
-            # Local ref so the closure keeps a non-None type for mypy.
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
@@ -819,23 +851,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             indexer = self.indexer
 
             def indexer_weights_proj() -> torch.Tensor:
-                # ReplicatedLinear returns (output, bias); bias is None.
                 weights, _ = indexer.weights_proj(hidden_states)
                 return weights
 
             aux_fns[1] = indexer_weights_proj
 
-        qr_kv, (kv_score, indexer_weights) = execute_in_parallel(
-            lambda: self._fused_wqa_wkv_gemm(hidden_states),
-            aux_fns,
-            self.ln_events[0],
-            self.ln_events[1:3],
-            aux_streams,
-            enable=hidden_states.shape[0]
-            <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
-        )
-
-        return qr_kv, kv_score, indexer_weights
+        return lambda: self._fused_wqa_wkv_gemm(hidden_states), aux_fns
 
     @eager_break_during_capture
     def _sparse_indexer_and_attn(

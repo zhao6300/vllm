@@ -69,6 +69,7 @@ def execute_in_parallel(
     done_events: list[torch.cuda.Event],
     aux_streams: list[torch.cuda.Stream] | None = None,
     enable: bool = False,
+    allow_capture: bool = False,
 ) -> tuple[Any, list[Any]]:
     """Run default_fn on the current stream and aux_fns concurrently on
     aux_streams.
@@ -102,7 +103,11 @@ def execute_in_parallel(
         result of aux_fns[i] (or None when skipped).
     """
     aux_results: list[Any]
-    if aux_streams is None or not enable or torch.cuda.is_current_stream_capturing():
+    if (
+        aux_streams is None
+        or not enable
+        or (torch.cuda.is_current_stream_capturing() and not allow_capture)
+    ):
         default_result = default_fn()
         aux_results = [fn() if fn is not None else None for fn in aux_fns]
         return default_result, aux_results

@@ -452,6 +452,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.hc_mult = config.hc_mult
         self.hc_dim = self.hc_mult * config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
+        self.dtype = vllm_config.model_config.dtype
 
         # Three aux streams: one per non-default input GEMM in
         # DeepseekV4Attention._run_parallel_input_projections
@@ -544,6 +545,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
         else:
             self._mtp_hidden_buffer = None
+
+    def warmup_multi_stream_cudagraph(self) -> None:
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            if not isinstance(layer, DeepseekV4DecoderLayer):
+                continue
+            dummy_hidden_states = torch.empty(
+                (1, layer.attn.hidden_size),
+                dtype=self.dtype,
+                device=layer.attn.fused_wqa_wkv.weight.device,
+            )
+            layer.attn.warmup_multi_stream_cudagraph(dummy_hidden_states)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1132,6 +1144,9 @@ class DeepseekV41LLMForCausalLM(
 
         self.num_moe_layers = len(self.moe_layers)
         self.extract_moe_parameters(example_moe)
+
+    def warmup_multi_stream_cudagraph(self) -> None:
+        self.model.warmup_multi_stream_cudagraph()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
