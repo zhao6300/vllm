@@ -12,6 +12,7 @@ import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.kernel import MEGA_MOE_BACKENDS
 from vllm.distributed import (
+    get_engram_dp_size,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -74,10 +75,11 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
-from ..common.engram import Engram, EngramLayout, NgramHashState
+from ..common.engram import EngramLayout, NgramHashState
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
 from ..common.pipeline import get_sharing_dependencies, validate_local_sharing
 from ..common.pipeline_sharing import PipelineSharing
+from .engram import Engram, gather_engram_hashes
 
 if typing.TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
@@ -335,6 +337,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                         residual,
                         engram_hashes[:, self.engram.layer_hash_index],
                         engram_mask,
+                        prepared_rows=engram_rows,
                     )
                 post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(
                     residual,
@@ -360,7 +363,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     residual,
                     engram_hashes[:, self.engram.layer_hash_index],
                     engram_mask,
-                    prepared_rows=engram_rows,
+                        prepared_rows=engram_rows,
                 )
             post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(
                 residual,
@@ -512,11 +515,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # layer's sliding-window KV cache. Only PP ranks owning an engram
         # layer need it.
         self.engram_hash: NgramHashState | None = None
+        self.engram_dp_shared_memory = bool(
+            vllm_config.engram_config and vllm_config.engram_config.dp_shared_memory
+        )
         self.engram_swa_prefix: str | None = None
         if self.engram_layout is not None:
             local_engram = any(
-                isinstance(layer, DeepseekV4DecoderLayer) and layer.engram is not None
+                isinstance(layer, DeepseekV4DecoderLayer)
+                and getattr(layer.engram, "dp_shared_memory", False)
                 for layer in islice(self.layers, self.start_layer, self.end_layer)
+            )
+            self.engram_sparse_shared = local_engram and all(
+                layer.engram.embed_tokens.is_pinned()
+                for layer in islice(self.layers, self.start_layer, self.end_layer)
+                if layer.engram is not None
             )
             if local_engram:
                 first_layer = next(
@@ -605,6 +617,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             hidden_states = intermediate_tensors["hidden_states"]
 
         pipeline_metadata = None
+        sparse_shared = self.engram_swa_prefix is not None
         if self.pipeline_sharing is not None and is_forward_context_available():
             context = get_forward_context()
             if context.attn_metadata is not None and not context.additional_kwargs.get(
@@ -634,6 +647,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         engram_hashes: torch.Tensor | None = None
         engram_mask: torch.Tensor | None = None
         engram_rows: dict[int, torch.Tensor] = {}
+        if self.engram_swa_prefix is not None:
+            self.pipeline_sharing = None
         if (
             self.engram_hash is not None
             and input_ids is not None
@@ -672,15 +687,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     swa_metadata.slot_mapping,
                     swa_metadata.block_table,
                 )
-                # Gather all Engram rows before entering the decoder layers.
-                for layer in islice(self.layers, self.start_layer, self.end_layer):
-                    engram = getattr(layer, "engram", None)
-                    if engram is not None:
-                        engram_rows[engram.layer_hash_index] = (
-                            engram.prepare_embeddings(
-                                engram_hashes[:, engram.layer_hash_index]
-                            )
-                        )
+        elif bool(self.engram_dp_shared_memory) != sparse_shared:
+            # DP-sharded lookups are collective, so a replica skipping the
+            # hash still has to reach them.
+            engram_hashes, engram_mask = self.engram_hash.dummy_hashes(input_ids)
+        if engram_hashes is not None:
+            # Gather all Engram rows before entering the decoder layers.
+            # One gather feeds every layer sharing the DP-split table.
+            gathered_hashes = gather_engram_hashes(
+                engram_hashes, dp_shared_memory=self.engram_dp_shared_memory
+            )
+            for layer in islice(self.layers, self.start_layer, self.end_layer):
+                engram = getattr(layer, "engram", None)
+                if engram is not None:
+                    engram_rows[engram.layer_hash_index] = engram.prepare_embeddings(
+                        gathered_hashes[:, engram.layer_hash_index]
+                    )
 
         full_num_tokens = positions.shape[0]
         pre_mix: torch.Tensor | None = None
