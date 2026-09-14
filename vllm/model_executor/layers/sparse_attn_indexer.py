@@ -710,7 +710,6 @@ def sparse_attn_indexer(
                 decode_metadata.schedule_metadata,
                 max_model_len,
             )
-        else:
             logits = fp8_fp4_paged_mqa_logits(
                 (padded_q_quant_cast, padded_q_scale),
                 kv_cache,

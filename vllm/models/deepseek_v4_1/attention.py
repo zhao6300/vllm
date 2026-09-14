@@ -43,7 +43,6 @@ from vllm.config import (
     get_current_vllm_config,
 )
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.platforms import current_platform
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -52,6 +51,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4_1.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
@@ -148,6 +148,13 @@ def _resolve_dsv4_kv_cache_dtype(
     return kv_cache_dtype, torch.bfloat16
 
 
+def _compressed_block_size(vllm_config: VllmConfig, compress_ratio: int) -> int:
+    # SM120 sparse-MLA and DeepGEMM indexer kernels require 64 compressed
+    # states per page. A ratio-2 cache therefore needs at least 128 manager
+    # tokens, even when the configured token block size is smaller.
+    return max(vllm_config.cache_config.block_size, 64 * compress_ratio)
+
+
 def _compressed_cache_spec(
     vllm_config: VllmConfig,
     head_dim: int,
@@ -156,8 +163,9 @@ def _compressed_cache_spec(
     cache_torch_dtype: torch.dtype,
 ) -> MLAAttentionSpec:
     uses_fp8_ds_mla_layout = cache_dtype == "fp8_ds_mla"
+    compressed_block_size = _compressed_block_size(vllm_config, compress_ratio)
     return MLAAttentionSpec(
-        block_size=vllm_config.cache_config.block_size,
+        block_size=compressed_block_size,
         num_kv_heads=1,
         head_size=head_dim,
         dtype=torch.uint8 if uses_fp8_ds_mla_layout else cache_torch_dtype,
@@ -611,7 +619,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             o_padded,
         )
         o = o_padded[:, : self.n_local_heads, :]
-
         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
         return self._o_proj(o, positions)
 
@@ -1041,7 +1048,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         # tokens_per_state=1 for V3.2, >1 for DeepseekV4; same cache layout.
         uses_fp8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
         return MLAAttentionSpec(
-            block_size=self.cache_config.block_size,
+            block_size=_compressed_block_size(vllm_config, self.compress_ratio),
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,

@@ -87,15 +87,15 @@ class DeepseekV4SparseMLABackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        # Support SM90 (Hopper), SM120/GB10, and SM121 (Blackwell variants) with
-        # block_size=64 for alignment with DeepseekV41IndexerBackend and indexer
-        # kernel constraints.
+        # SM120 sparse-MLA pages are compressed states. Ratio-1 and ratio-2
+        # layers use token block sizes 64 and 128 respectively to get the same
+        # required 64-state page.
         if (
             current_platform.is_device_capability_family(90)
             or current_platform.is_device_capability_family(120)
             or current_platform.is_device_capability_family(121)
         ):
-            return [64]
+            return [MultipleOf(64)]
         return [128]
 
     @staticmethod
