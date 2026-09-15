@@ -39,9 +39,9 @@ from vllm.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm.forward_context import set_forward_context
-from vllm.models.deepseek_v4_1.common.engram import EngramLayout
-from vllm.models.deepseek_v4_1.nvidia import engram as engram_ops
-from vllm.models.deepseek_v4_1.nvidia.engram import (
+from vllm.models.deepseek_v41.common.engram import EngramLayout
+from vllm.models.deepseek_v41.nvidia import engram as engram_ops
+from vllm.models.deepseek_v41.nvidia.engram import (
     Engram,
     ParallelEngramEmbedding,
     engram_head_shard_rank,
@@ -473,9 +473,8 @@ def _check_dummy_hash_model_forward(
     vllm_config, engram, head_sizes, weight, scales, dp_shared_memory
 ):
     """A metadata-less replica joins DP sharding but skips a shared lookup."""
-    from vllm.models.deepseek_v4_1.common.engram import NgramHashState
-    from vllm.models.deepseek_v4_1.nvidia import model as model_ops
-
+    from vllm.models.deepseek_v41.common.engram import NgramHashState
+    from vllm.models.deepseek_v41.nvidia import model as model_ops
 
     dp_rank = vllm_config.parallel_config.data_parallel_rank
     if dp_shared_memory and dp_rank != 1:
@@ -486,13 +485,15 @@ def _check_dummy_hash_model_forward(
     torch.nn.Module.__init__(state)
     state.multipliers = torch.empty(1, 2, dtype=torch.int64, device="cuda")
     state.primes = torch.empty(1, 1, len(head_sizes), dtype=torch.int64, device="cuda")
-    state.ensure_cache = lambda: False
+    state.ensure_cache = lambda: True
     # Hash arithmetic is covered separately; keep the real model's branch and
     # NgramHashState.dummy_hashes, plus real preparation/lookup collectives.
     state.forward = lambda *args: ids.unsqueeze(1)
 
     class Decoder(SimpleNamespace):
-        def __call__(self, hidden, positions, input_ids, *args):
+        # Engram hashes and the mask stay the last positional arguments;
+        # **kwargs absorbs the decoder's keyword-only flags.
+        def __call__(self, hidden, positions, input_ids, *args, **kwargs):
             hashes, keep = args[-2:]
             if dp_shared_memory and dp_rank == 1:
                 assert hashes is None and keep is None
@@ -505,12 +506,12 @@ def _check_dummy_hash_model_forward(
                 if dp_rank == 1:
                     assert torch.all(hashes == engram_ops.DEAD_ID)
                 output = engram.embed(hashes[:, 0])
-            return output, None, None, None, None
+            # Trailing None is previous_aux; this stub captures no aux states.
+            return output, None, None, None, None, None
 
     model = SimpleNamespace(
         use_mega_moe=False,
         use_sequence_parallel=False,
-        pipeline_sharing=None,
         engram_hash=state,
         engram_swa_prefix="swa",
         engram_dp_shared_memory=dp_shared_memory,
@@ -518,7 +519,6 @@ def _check_dummy_hash_model_forward(
         start_layer=0,
         end_layer=1,
         aux_hidden_state_layers=(),
-        engram_sparse_shared=False,
     )
     metadata = (
         None

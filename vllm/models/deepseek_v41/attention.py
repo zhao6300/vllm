@@ -26,7 +26,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.models.common.ops import fused_q_kv_rmsnorm
-from vllm.models.deepseek_v4_1.common.ops import (
+from vllm.models.deepseek_v41.common.ops import (
     MXFP4_BLOCK_SIZE,
     fused_indexer_q_rope_quant,
     indexer_k_norm_rope_store,
@@ -49,9 +49,8 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.models.deepseek_v4_1.common.rope import build_deepseek_v4_rope
-from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
-from vllm.platforms import current_platform
+from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
+from vllm.models.deepseek_v41.compressor import DeepseekCompressor
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
@@ -148,36 +147,6 @@ def _resolve_dsv4_kv_cache_dtype(
     return kv_cache_dtype, torch.bfloat16
 
 
-def _compressed_block_size(vllm_config: VllmConfig, compress_ratio: int) -> int:
-    # SM120 sparse-MLA and DeepGEMM indexer kernels require 64 compressed
-    # states per page. A ratio-2 cache therefore needs at least 128 manager
-    # tokens, even when the configured token block size is smaller.
-    return max(vllm_config.cache_config.block_size, 64 * compress_ratio)
-
-
-def _compressed_cache_spec(
-    vllm_config: VllmConfig,
-    head_dim: int,
-    compress_ratio: int,
-    cache_dtype: str,
-    cache_torch_dtype: torch.dtype,
-) -> MLAAttentionSpec:
-    uses_fp8_ds_mla_layout = cache_dtype == "fp8_ds_mla"
-    compressed_block_size = _compressed_block_size(vllm_config, compress_ratio)
-    return MLAAttentionSpec(
-        block_size=compressed_block_size,
-        num_kv_heads=1,
-        head_size=head_dim,
-        dtype=torch.uint8 if uses_fp8_ds_mla_layout else cache_torch_dtype,
-        tokens_per_state=compress_ratio,
-        cache_dtype_str=cache_dtype,
-        alignment=576 if uses_fp8_ds_mla_layout else 512,
-        model_version="deepseek_v4",
-        kv_quant_mode=get_kv_quant_mode(cache_dtype),
-        state_content_bytes=584 if uses_fp8_ds_mla_layout else None,
-    )
-
-
 class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     """DeepseekV4 MLA attention layer.
 
@@ -187,7 +156,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     ``DeepseekV4FlashInferSM120Attention`` /
     ``DeepseekV4FlashInferMLAAttention`` (CUDA) or
     ``DeepseekV41ROCMAiterMLAAttention`` (ROCm) — selected by the platform-specific
-    deepseek_v4_1 model module. The base is never instantiated directly.
+    deepseek_v41 model module. The base is never instantiated directly.
     """
 
     # Provided by the platform subclass.
@@ -463,7 +432,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # [1] doubles as post-GEMM event1. Reuse is safe: GEMM fully joins
         # before post-GEMM starts.
         self.ln_events = [torch.cuda.Event() for _ in range(4)]
-        self._multi_streams_warmed = False
 
         assert cache_config is not None, "DeepseekV4 attention requires cache_config"
         # ---- Attention / KV-cache setup ----
@@ -478,18 +446,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self._uses_fp8_ds_mla_layout(), cache_config.cache_dtype, cache_config
         )
 
-        # Determine block_size based on GPU architecture for SM120/121 support.
-        # Defaults to 32 if platform info is unavailable (e.g., non-GPU CI).
-        try:
-            is_sm120_or_sm121 = (
-                current_platform.is_device_capability_family(120)
-                or current_platform.is_device_capability_family(121)
-            )
-            swa_block_size = 64 if is_sm120_or_sm121 else 32
-        except (AttributeError, RuntimeError):
-            # Fallback for non-GPU environments or when platform is unavailable
-            swa_block_size = 32
-
         self.swa_cache_layer = DeepseekV4SWACache(
             head_dim=self.head_dim,
             window_size=self.window_size,
@@ -497,7 +453,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             prefix=f"{prefix}.swa_cache",
             cache_config=cache_config,
             backend_cls=self.swa_backend_cls,
-            block_size=swa_block_size,
+            block_size=32,
         )
 
         # The attention layer itself was already registered with the
@@ -580,7 +536,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 "FLASHMLA_SPARSE_DSV41",
                 "ROCM_FLASHMLA_SPARSE_DSV4",
             ):
-                from vllm.models.deepseek_v4_1.common.ops.cache_utils import (
+                from vllm.models.deepseek_v41.common.ops.cache_utils import (
                     _COMBINE_TOPK_SWA_INDICES_KERNEL,
                 )
 
@@ -619,12 +575,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             o_padded,
         )
         o = o_padded[:, : self.n_local_heads, :]
+
         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
         return self._o_proj(o, positions)
 
     @cached_property
     def _can_fuse_query_quant(self) -> bool:
-        from vllm.models.deepseek_v4_1.common.ops.query_quant import (
+        from vllm.models.deepseek_v41.common.ops.query_quant import (
             can_fuse_query_quant,
         )
 
@@ -643,7 +600,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         """
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
         if self.q_lora_rank % 32 == 0 and self._can_fuse_query_quant:
-            from vllm.models.deepseek_v4_1.common.ops.query_quant import (
+            from vllm.models.deepseek_v41.common.ops.query_quant import (
                 fused_q_kv_rmsnorm_quant,
             )
 
@@ -799,50 +756,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         torch.Tensor | None,
         torch.Tensor | None,
     ]:
+        aux_streams = self.aux_stream_list
+        if aux_streams is not None:
+            aux_streams = aux_streams[:2]
+
         # fused_wqa_wkv (heaviest) on default; the two lighter input GEMMs on
         # aux streams 0/1 when their owning module exists. ln_events[0] is the
         # fan-out start event; ln_events[1..2] are per-aux done events. The
         # v4.1 indexer derives K from the kv-source compressor's latent, so
         # unlike v4.0 there is no indexer K GEMM over hidden_states here.
-        default_fn, aux_fns = self._projection_fns(hidden_states)
-
-        qr_kv, (kv_score, indexer_weights) = execute_in_parallel(
-            default_fn,
-            aux_fns,
-            self.ln_events[0],
-            self.ln_events[1:3],
-            self.aux_stream_list[:2],
-            enable=hidden_states.shape[0]
-            <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
-            allow_capture=self._multi_streams_warmed,
-        )
-
-        return qr_kv, kv_score, indexer_weights
-
-    def warmup_multi_stream_cudagraph(self, hidden_states: torch.Tensor) -> None:
-        if (
-            self._multi_streams_warmed
-            or self.aux_stream_list is None
-            or torch.cuda.is_current_stream_capturing()
-        ):
-            return
-
-        default_fn, aux_fns = self._projection_fns(hidden_states)
-        for index, fn in enumerate(aux_fns):
-            if fn is None:
-                continue
-            with torch.cuda.stream(self.aux_stream_list[index]):
-                fn()
-        default_fn()
-        torch.cuda.synchronize()
-        self._multi_streams_warmed = True
-
-    def _projection_fns(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[Callable[[], torch.Tensor], list[Callable[[], Any] | None]]:
         aux_fns: list[Callable[[], Any] | None] = [None, None]
 
         if self.compressor is not None:
+            # Local ref so the closure keeps a non-None type for mypy.
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
@@ -858,12 +784,23 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             indexer = self.indexer
 
             def indexer_weights_proj() -> torch.Tensor:
+                # ReplicatedLinear returns (output, bias); bias is None.
                 weights, _ = indexer.weights_proj(hidden_states)
                 return weights
 
             aux_fns[1] = indexer_weights_proj
 
-        return lambda: self._fused_wqa_wkv_gemm(hidden_states), aux_fns
+        qr_kv, (kv_score, indexer_weights) = execute_in_parallel(
+            lambda: self._fused_wqa_wkv_gemm(hidden_states),
+            aux_fns,
+            self.ln_events[0],
+            self.ln_events[1:3],
+            aux_streams,
+            enable=hidden_states.shape[0]
+            <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
+        )
+
+        return qr_kv, kv_score, indexer_weights
 
     @eager_break_during_capture
     def _sparse_indexer_and_attn(
@@ -1000,12 +937,20 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # fp8_ds_mla is a UE8M0 block-scaled uint8 layout and needs 576B
         # alignment; plain bf16 / per-tensor fp8 rows use natural element-size
         # pages.
-        return _compressed_cache_spec(
-            vllm_config,
-            self.head_dim,
-            self.compress_ratio,
-            self.kv_cache_dtype,
-            self.kv_cache_torch_dtype,
+        uses_fp8_ds_mla_layout = self.kv_cache_dtype == "fp8_ds_mla"
+        return MLAAttentionSpec(
+            block_size=vllm_config.cache_config.block_size,
+            num_kv_heads=1,
+            head_size=self.head_dim,
+            dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.kv_cache_torch_dtype,
+            tokens_per_state=self.compress_ratio,
+            cache_dtype_str=self.kv_cache_dtype,
+            alignment=576 if uses_fp8_ds_mla_layout else 512,
+            model_version="deepseek_v4",
+            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+            # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token;
+            # head_size stays semantic (512).
+            state_content_bytes=584 if uses_fp8_ds_mla_layout else None,
         )
 
     def _compressed_kv_cache(self) -> torch.Tensor:
@@ -1048,7 +993,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         # tokens_per_state=1 for V3.2, >1 for DeepseekV4; same cache layout.
         uses_fp8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
         return MLAAttentionSpec(
-            block_size=_compressed_block_size(vllm_config, self.compress_ratio),
+            block_size=self.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
@@ -1061,76 +1006,6 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return DeepseekV41IndexerBackend
-
-
-class DeepseekV4PipelineCache(nn.Module, AttentionLayerBase):
-    """Weight-free replica registered under the original KV source's layer name."""
-
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        prefix: str,
-        source_layer: int,
-        attn_cls: type[DeepseekV4Attention],
-    ) -> None:
-        super().__init__()
-        config = vllm_config.model_config.hf_config
-        cache_config = vllm_config.cache_config
-        self.head_dim = config.head_dim
-        self.compress_ratio = config.compress_ratios[source_layer]
-        self.kv_cache_dtype, self.kv_cache_torch_dtype = _resolve_dsv4_kv_cache_dtype(
-            attn_cls.use_fp8_ds_mla_layout, cache_config.cache_dtype, cache_config
-        )
-        self.backend_cls = attn_cls.backend_cls
-        self.prefix = prefix
-        self.kv_cache = torch.tensor([])
-        context = vllm_config.compilation_config.static_forward_context
-        if prefix in context:
-            raise ValueError(f"Duplicate pipeline cache name: {prefix}")
-        context[prefix] = self
-
-    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
-        self.kv_cache = kv_cache.squeeze(1)
-
-    def get_attn_backend(self) -> type[AttentionBackend]:
-        return self.backend_cls
-
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        return _compressed_cache_spec(
-            vllm_config,
-            self.head_dim,
-            self.compress_ratio,
-            self.kv_cache_dtype,
-            self.kv_cache_torch_dtype,
-        )
-
-    def forward(self):
-        raise RuntimeError("Pipeline cache replicas do not execute attention")
-
-
-def make_pipeline_cache_replica(
-    vllm_config: VllmConfig,
-    source_prefix: str,
-    source_layer: int,
-    kind: str,
-    attn_cls: type[DeepseekV4Attention],
-) -> DeepseekV4PipelineCache | DeepseekV4IndexerCache:
-    if kind == "kv":
-        return DeepseekV4PipelineCache(
-            vllm_config, source_prefix, source_layer, attn_cls
-        )
-    if kind != "index_k":
-        raise ValueError(f"Unsupported pipeline cache kind: {kind}")
-    config = vllm_config.model_config.hf_config
-    return DeepseekV4IndexerCache(
-        head_dim=_indexer_k_cache_head_dim(
-            config.index_head_dim, dsa_indexer_uses_fp4(vllm_config)
-        ),
-        dtype=torch.uint8,
-        prefix=f"{source_prefix}.indexer.k_cache",
-        cache_config=vllm_config.cache_config,
-        compress_ratio=config.compress_ratios[source_layer],
-    )
 
 
 class DeepseekV4Indexer(nn.Module):
