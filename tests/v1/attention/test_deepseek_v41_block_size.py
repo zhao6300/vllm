@@ -190,6 +190,9 @@ def test_v41_attention_cache_spec_sizes_state_page(
     attention.kv_cache_torch_dtype = torch.uint8
     attention.head_dim = 512
     attention.compress_ratio = compress_ratio
+    attention.kv_mxfp8 = False
+    attention.kv_bytes_per_token = 584
+    attention.kv_page_alignment = 576
 
     spec = attention.get_kv_cache_spec(vllm_config)
     selected_block_size = min(spec.block_size, 64 * compress_ratio)
