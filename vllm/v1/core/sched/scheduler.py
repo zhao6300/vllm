@@ -57,9 +57,9 @@ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutp
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
+    SlidingWindowSpec,
     get_mamba_prefill_checkpoint_position,
     is_mamba_prefill_checkpoint_valid,
-    SlidingWindowSpec,
     iter_layer_specs,
 )
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
