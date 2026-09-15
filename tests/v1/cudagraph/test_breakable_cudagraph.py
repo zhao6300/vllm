@@ -453,7 +453,6 @@ def test_execute_in_parallel_falls_back_inside_breakable_capture(
             [done_event],
             [aux_stream],
             enable=True,
-            allow_capture=True,
         )
 
     assert cap.num_graphs == 1

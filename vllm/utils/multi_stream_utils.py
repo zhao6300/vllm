@@ -69,7 +69,6 @@ def execute_in_parallel(
     done_events: list[torch.cuda.Event],
     aux_streams: list[torch.cuda.Stream] | None = None,
     enable: bool = False,
-    allow_capture: bool = False,
 ) -> tuple[Any, list[Any]]:
     """Run default_fn on the current stream and aux_fns concurrently on
     aux_streams.
@@ -103,18 +102,10 @@ def execute_in_parallel(
         result of aux_fns[i] (or None when skipped).
     """
     aux_results: list[Any]
-    capturing = torch.cuda.is_current_stream_capturing()
-    breakable_capture = False
-    if capturing:
-        from vllm.compilation.breakable_cudagraph import (
-            BreakableCUDAGraphCapture,
-        )
-
-        breakable_capture = BreakableCUDAGraphCapture.is_active()
     if (
         aux_streams is None
         or not enable
-        or (capturing and (not allow_capture or breakable_capture))
+        or torch.cuda.is_current_stream_capturing()
     ):
         default_result = default_fn()
         aux_results = [fn() if fn is not None else None for fn in aux_fns]
