@@ -162,6 +162,46 @@ def test_v41_compressed_cache_spec_sizes_state_page(
     [
         (32, 1, 64),
         (64, 1, 64),
+        (128, 1, 128),
+        (64, 2, 128),
+        (128, 2, 128),
+    ],
+)
+def test_v41_attention_cache_spec_sizes_state_page(
+    config_block_size,
+    compress_ratio,
+    expected,
+):
+    from types import SimpleNamespace
+
+    from vllm.models.deepseek_v41.nvidia.flashinfer_sparse import (
+        DeepseekV4FlashInferSM120Attention,
+    )
+
+    vllm_config = mock.Mock()
+    vllm_config.cache_config = SimpleNamespace(block_size=config_block_size)
+    vllm_config.model_config = mock.Mock()
+
+    attention = DeepseekV4FlashInferSM120Attention.__new__(
+        DeepseekV4FlashInferSM120Attention
+    )
+    attention.is_kv_source = True
+    attention.kv_cache_dtype = "fp8_ds_mla"
+    attention.kv_cache_torch_dtype = torch.uint8
+    attention.head_dim = 512
+    attention.compress_ratio = compress_ratio
+
+    spec = attention.get_kv_cache_spec(vllm_config)
+    selected_block_size = min(spec.block_size, 64 * compress_ratio)
+    assert spec.block_size == expected
+    assert spec.get_num_kernel_states(selected_block_size) == 64
+
+
+@pytest.mark.parametrize(
+    ("config_block_size", "compress_ratio", "expected"),
+    [
+        (32, 1, 64),
+        (64, 1, 64),
         (64, 2, 128),
         (128, 2, 128),
     ],
