@@ -110,6 +110,16 @@ def _fill_short_context_topk_indices(
     )
 
 
+# Which packed fp8_ds_mla record a V4.1 layer writes. FlashMLA decodes
+# DeepSeek's V4.1 record -- all 512 dims (RoPE included) as fp8 e4m3 with one
+# UE8M0 scale per 32 dims, 512 data bytes + 16 scale bytes per token, pages
+# rounded to the kernel's 512 B TMA stride -- only in its SM100 sparse-decode
+# kernels. Every other arch keeps the V4 record: 448 fp8 NoPE + 64 bf16 RoPE
+# plus 7 UE8M0 scales of 64 dims and a pad byte (584 B, 576 B pages).
+def _use_v41_mxfp8_kv_record() -> bool:
+    return current_platform.is_device_capability_family(100)
+
+
 def _resolve_dsv4_kv_cache_dtype(
     use_fp8_ds_mla_layout: bool,
     kv_cache_dtype: str,
@@ -475,6 +485,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.kv_cache_dtype, self.kv_cache_torch_dtype = _resolve_dsv4_kv_cache_dtype(
             self._uses_fp8_ds_mla_layout(), cache_config.cache_dtype, cache_config
         )
+        self.kv_mxfp8 = _use_v41_mxfp8_kv_record()
+        self.kv_bytes_per_token = 528 if self.kv_mxfp8 else 584
+        self.kv_page_alignment = 512 if self.kv_mxfp8 else 576
 
         try:
             swa_block_size = (
@@ -494,6 +507,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             cache_config=cache_config,
             backend_cls=self.swa_backend_cls,
             block_size=swa_block_size,
+            packed_bytes_per_token=self.kv_bytes_per_token,
+            packed_page_alignment=self.kv_page_alignment,
         )
 
         # The attention layer itself was already registered with the
@@ -919,6 +934,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.eps,
                 swa_metadata.block_size,
                 False,
+                self.kv_mxfp8,
             )
 
         # Plain-row path: the [num_blocks, block_size, 512] cache stores the KV
@@ -974,9 +990,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # DeepseekV4SWACache.
         if not self.is_kv_source:
             return None
-        # fp8_ds_mla is a UE8M0 block-scaled uint8 layout and needs 576B
-        # alignment; plain bf16 / per-tensor fp8 rows use natural element-size
-        # pages.
+        # fp8_ds_mla is a UE8M0 block-scaled uint8 layout whose page rounds up
+        # to the decode kernel's TMA stride; plain bf16 / per-tensor fp8 rows
+        # use natural element-size pages.
         uses_fp8_ds_mla_layout = self.kv_cache_dtype == "fp8_ds_mla"
         # DeepSeek-V4.1 sparse-MLA pages are compressed states. Keep each page
         # wide enough to carry at least 64 kernel states, preserving any larger
@@ -992,12 +1008,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.kv_cache_torch_dtype,
             tokens_per_state=self.compress_ratio,
             cache_dtype_str=self.kv_cache_dtype,
-            alignment=576 if uses_fp8_ds_mla_layout else 512,
+            alignment=self.kv_page_alignment if uses_fp8_ds_mla_layout else 512,
             model_version="deepseek_v4",
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
-            # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token;
-            # head_size stays semantic (512).
-            state_content_bytes=584 if uses_fp8_ds_mla_layout else None,
+            # Packed record width; head_size stays semantic (512).
+            state_content_bytes=(
+                self.kv_bytes_per_token if uses_fp8_ds_mla_layout else None
+            ),
         )
 
     def _compressed_kv_cache(self) -> torch.Tensor:
@@ -1051,8 +1068,15 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
             head_size=self.head_dim,
             dtype=self.dtype,
             tokens_per_state=self.compress_ratio,
-            # 576B for FlashMLA packing; 512B for FlashInfer sparse (#44577).
-            alignment=576 if uses_fp8_ds_mla_layout else 512,
+            # The indexer page shares a physical block with the main KV cache
+            # (the block stride is the sum of every page in the group), so it
+            # has to carry the same padding: the packed record's TMA stride,
+            # else 512B for FlashInfer sparse (#44577).
+            alignment=(
+                576
+                if uses_fp8_ds_mla_layout and not _use_v41_mxfp8_kv_record()
+                else 512
+            ),
         )
 
     def forward(self): ...
