@@ -51,6 +51,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v41.compressor import DeepseekCompressor
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
@@ -155,8 +156,15 @@ def _compressed_cache_spec(
     cache_torch_dtype: torch.dtype,
 ) -> MLAAttentionSpec:
     uses_fp8_ds_mla_layout = cache_dtype == "fp8_ds_mla"
+    # DeepSeek-V4.1 sparse-MLA pages are compressed states. Ratio-1 and
+    # ratio-2 layers use 64 and 128 tokens respectively to carry at least 64
+    # kernel states, while preserving any larger configured page width.
+    block_size = max(
+        vllm_config.cache_config.block_size,
+        64 * compress_ratio,
+    )
     return MLAAttentionSpec(
-        block_size=vllm_config.cache_config.block_size,
+        block_size=block_size,
         num_kv_heads=1,
         head_size=head_dim,
         dtype=torch.uint8 if uses_fp8_ds_mla_layout else cache_torch_dtype,
@@ -468,6 +476,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self._uses_fp8_ds_mla_layout(), cache_config.cache_dtype, cache_config
         )
 
+        try:
+            swa_block_size = (
+                64
+                if current_platform.is_device_capability_family(120)
+                or current_platform.is_device_capability_family(121)
+                else 32
+            )
+        except (AttributeError, RuntimeError):
+            swa_block_size = 32
+
         self.swa_cache_layer = DeepseekV4SWACache(
             head_dim=self.head_dim,
             window_size=self.window_size,
@@ -475,7 +493,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             prefix=f"{prefix}.swa_cache",
             cache_config=cache_config,
             backend_cls=self.swa_backend_cls,
-            block_size=32,
+            block_size=swa_block_size,
         )
 
         # The attention layer itself was already registered with the
@@ -1014,8 +1032,14 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         # head_dim already carries the fp8 scale padding
         # tokens_per_state=1 for V3.2, >1 for DeepseekV4; same cache layout.
         uses_fp8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+        # Align with the compressed-cache spec so each page carries the same
+        # number of kernel states as the sparse-MLA state page.
+        block_size = max(
+            vllm_config.cache_config.block_size,
+            64 * self.compress_ratio,
+        )
         return MLAAttentionSpec(
-            block_size=self.cache_config.block_size,
+            block_size=block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,

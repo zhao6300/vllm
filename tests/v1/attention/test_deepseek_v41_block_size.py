@@ -30,10 +30,10 @@ def _other_platform(mock_platform):
 
 
 def test_v41_sparse_mla_accepts_ratio_token_block_sizes():
-    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV4SparseMLABackend
+    from vllm.models.deepseek_v41.sparse_mla import DeepseekV4SparseMLABackend
 
     with mock.patch(
-        "vllm.models.deepseek_v4_1.sparse_mla.current_platform"
+        "vllm.models.deepseek_v41.sparse_mla.current_platform"
     ) as mock_platform:
         _sm12x_platform(mock_platform)
         sizes = DeepseekV4SparseMLABackend.get_supported_kernel_block_sizes()
@@ -58,7 +58,7 @@ def test_v41_indexer_accepts_ratio_token_block_sizes():
 
 
 def test_v41_select_common_block_size_uses_ratio_page_width():
-    from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse import (
+    from vllm.models.deepseek_v41.nvidia.flashinfer_sparse import (
         DeepseekV4FlashInferMLASparseBackend,
     )
     from vllm.v1.attention.backends.mla.indexer import DeepseekV41IndexerBackend
@@ -72,7 +72,7 @@ def test_v41_select_common_block_size_uses_ratio_page_width():
     ]
 
     with mock.patch(
-        "vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse.current_platform"
+        "vllm.models.deepseek_v41.nvidia.flashinfer_sparse.current_platform"
     ) as mock_platform:
         _sm12x_platform(mock_platform)
         assert select_common_block_size(64, backends) == 64
@@ -80,7 +80,7 @@ def test_v41_select_common_block_size_uses_ratio_page_width():
 
 
 def test_v41_flashinfer_shared_backends_use_common_minimum():
-    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV4SparseMLABackend
+    from vllm.models.deepseek_v41.sparse_mla import DeepseekV4SparseMLABackend
     from vllm.v1.attention.backends.mla.indexer import DeepseekV41IndexerBackend
     from vllm.v1.worker.utils import select_common_block_size
 
@@ -88,7 +88,7 @@ def test_v41_flashinfer_shared_backends_use_common_minimum():
 
     with (
         mock.patch(
-            "vllm.models.deepseek_v4_1.sparse_mla.current_platform"
+            "vllm.models.deepseek_v41.sparse_mla.current_platform"
         ) as sparse_platform,
         mock.patch(
             "vllm.v1.attention.backends.mla.indexer.current_platform"
@@ -101,7 +101,7 @@ def test_v41_flashinfer_shared_backends_use_common_minimum():
 
 
 def test_v41_other_architectures_keep_128_token_pages():
-    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV4SparseMLABackend
+    from vllm.models.deepseek_v41.sparse_mla import DeepseekV4SparseMLABackend
     from vllm.v1.attention.backends.mla.indexer import DeepseekV41IndexerBackend
     from vllm.v1.worker.utils import select_common_block_size
 
@@ -109,7 +109,7 @@ def test_v41_other_architectures_keep_128_token_pages():
 
     with (
         mock.patch(
-            "vllm.models.deepseek_v4_1.sparse_mla.current_platform"
+            "vllm.models.deepseek_v41.sparse_mla.current_platform"
         ) as sparse_platform,
         mock.patch(
             "vllm.v1.attention.backends.mla.indexer.current_platform"
@@ -135,7 +135,7 @@ def test_v41_compressed_cache_spec_sizes_state_page(
     compress_ratio,
     expected,
 ):
-    from vllm.models.deepseek_v4_1.attention import _compressed_cache_spec
+    from vllm.models.deepseek_v41.attention import _compressed_cache_spec
 
     vllm_config = mock.Mock()
     vllm_config.cache_config.block_size = config_block_size
@@ -171,7 +171,7 @@ def test_v41_indexer_cache_matches_compressed_state_page(
     compress_ratio,
     expected,
 ):
-    from vllm.models.deepseek_v4_1.attention import (
+    from vllm.models.deepseek_v41.attention import (
         DeepseekV4IndexerCache,
         _indexer_k_cache_head_dim,
     )
